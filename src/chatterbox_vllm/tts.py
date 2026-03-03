@@ -93,12 +93,28 @@ class ChatterboxTTS:
                    # Original Chatterbox defaults this to False. I don't see a substantial performance difference when running with FP16.
                    s3gen_use_fp16: bool = False,
                    **kwargs) -> 'ChatterboxTTS':
-        ckpt_dir = Path(ckpt_dir)
+        ckpt_dir = Path(ckpt_dir).resolve()
 
         t3_config = T3Config()
 
+        # vLLM requires the T3 transformer weights to be named 'model.safetensors'.
+        # Create a symlink inside ckpt_dir if the file doesn't already exist under that name.
+        t3_weight_filename = "t3_cfg.safetensors" if variant == "english" else "t3_mtl23ls_v2.safetensors"
+        model_safetensors_path = ckpt_dir / "model.safetensors"
+        if not model_safetensors_path.exists():
+            model_safetensors_path.unlink(missing_ok=True)  # remove stale symlink if any
+            model_safetensors_path.symlink_to(ckpt_dir / t3_weight_filename)
+
+        # vLLM requires a config.json describing the model architecture.
+        # Copy the bundled config into ckpt_dir if not already present.
+        vllm_config_path = ckpt_dir / "config.json"
+        if not vllm_config_path.exists():
+            from importlib.resources import files as pkg_files
+            config_bytes = pkg_files("chatterbox_vllm.models.t3").joinpath("config.json").read_bytes()
+            vllm_config_path.write_bytes(config_bytes)
+
         # Load *just* the necessary weights to perform inference with T3CondEnc
-        t3_weights = load_file(ckpt_dir / ("t3_cfg.safetensors" if variant == "english" else "t3_mtl23ls_v2.safetensors"))
+        t3_weights = load_file(ckpt_dir / t3_weight_filename)
 
         t3_enc = T3CondEnc(t3_config)
         t3_enc.load_state_dict({ k.replace('cond_enc.', ''):v for k,v in t3_weights.items() if k.startswith('cond_enc.') })
@@ -124,7 +140,7 @@ class ChatterboxTTS:
         print(f"Giving vLLM {vllm_memory_percent * 100:.2f}% of GPU memory ({vllm_memory_needed / 1024**2:.2f} MB)")
 
         base_vllm_kwargs = {
-            "model": "./t3-model" if variant == "english" else "./t3-model-multilingual",
+            "model": str(ckpt_dir),
             "task": "generate",
             "tokenizer": "EnTokenizer" if variant == "english" else "MtlTokenizer",
             "tokenizer_mode": "custom",
@@ -161,12 +177,6 @@ class ChatterboxTTS:
         for fpath in ["ve.safetensors", "t3_cfg.safetensors", "s3gen.safetensors", "tokenizer.json", "conds.pt"]:
             local_path = hf_hub_download(repo_id=repo_id, filename=fpath, revision=revision)
 
-        # Ensure the symlink in './t3-model/model.safetensors' points to t3_cfg_path
-        t3_cfg_path = Path(local_path).parent / "t3_cfg.safetensors"
-        model_safetensors_path = Path.cwd() / "t3-model" / "model.safetensors"
-        model_safetensors_path.unlink(missing_ok=True)
-        model_safetensors_path.symlink_to(t3_cfg_path)
-
         return cls.from_local(Path(local_path).parent, variant="english", *args, **kwargs)
 
     @classmethod
@@ -176,12 +186,6 @@ class ChatterboxTTS:
                                     *args, **kwargs) -> 'ChatterboxTTS':
         for fpath in ["ve.safetensors", "t3_mtl23ls_v2.safetensors", "s3gen.safetensors", "grapheme_mtl_merged_expanded_v1.json", "conds.pt", "Cangjie5_TC.json"]:
             local_path = hf_hub_download(repo_id=repo_id, filename=fpath, revision=revision)
-
-        # Ensure the symlink in './t3-model-multilingual/model.safetensors' points to t3_cfg_path
-        t3_cfg_path = Path(local_path).parent / "t3_mtl23ls_v2.safetensors"
-        model_safetensors_path = Path.cwd() / "t3-model-multilingual" / "model.safetensors"
-        model_safetensors_path.unlink(missing_ok=True)
-        model_safetensors_path.symlink_to(t3_cfg_path)
 
         return cls.from_local(Path(local_path).parent, variant="multilingual", *args, **kwargs)
     
