@@ -133,9 +133,12 @@ class ChatterboxTTS:
         
         # Heuristic: rough calculation for what percentage of GPU memory to give to vLLM.
         # Tune this until the 'Maximum concurrency for ___ tokens per request: ___x' is just over 1.
-        # This rough heuristic gives 1.55GB for the model weights plus 128KB per token.
-        vllm_memory_needed = (1.55*1024*1024*1024) + (max_batch_size * max_model_len * 1024 * 128)
-        vllm_memory_percent = vllm_memory_needed / unused_gpu_memory
+        # 1.75GB covers model weights + vLLM runtime overhead; 256KB/token covers KV cache
+        # with enough headroom for vLLM's block-allocator rounding.
+        # The result is clamped to at least 5% so that on large GPUs (e.g. A40/A100) the
+        # absolute KV cache budget doesn't become vanishingly small.
+        vllm_memory_needed = (1.75*1024*1024*1024) + (max_batch_size * max_model_len * 1024 * 256)
+        vllm_memory_percent = max(vllm_memory_needed / unused_gpu_memory, 0.05)
 
         print(f"Giving vLLM {vllm_memory_percent * 100:.2f}% of GPU memory ({vllm_memory_needed / 1024**2:.2f} MB)")
 
