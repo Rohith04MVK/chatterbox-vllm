@@ -308,6 +308,14 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
                 hf_llama_weights[subname] = weight
                 continue
             loaded_params.add(name)
+            if '.' not in name:
+                # Top-level tensor with no sub-module path (e.g. a bare scalar saved in the checkpoint).
+                # Try to copy it directly onto a matching nn.Parameter or Tensor attribute.
+                if hasattr(self, name):
+                    param = getattr(self, name)
+                    if isinstance(param, (nn.Parameter, torch.Tensor)):
+                        param.data.copy_(weight)
+                continue
             attr, subname = name.split('.', 1)
             state_dict = state_dicts.get(attr, {})
             state_dict[subname] = weight
