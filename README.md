@@ -59,14 +59,33 @@ source .venv/bin/activate
 uv sync
 ```
 
-The package should automatically download the correct model weights from the Hugging Face Hub.
+The package downloads model weights into a dedicated cache at `~/.cache/chatterbox-vllm/<variant>/<revision>/`. Override the cache root with `CHATTERBOX_MODEL_DIR`, or pass `download_dir=` to `from_pretrained`.
+
+To use a local or Docker-mounted checkpoint, pass the actual directory — vLLM is pointed at that path, not a CWD-relative `./t3-model` folder:
+
+```python
+# Pre-downloaded / vendored weights, e.g. Docker: /app/local_model
+model = ChatterboxTTS.from_local("/app/local_model")
+
+# Same thing via the Hugging Face-style API
+model = ChatterboxTTS.from_pretrained("/app/local_model")
+```
+
+Expected files in that directory (English): `ve.safetensors`, `t3_cfg.safetensors` (or `model.safetensors`), `s3gen.safetensors`, `tokenizer.json`, `conds.pt`. For multilingual, use `t3_mtl23ls_v2.safetensors`, `grapheme_mtl_merged_expanded_v1.json`, and `Cangjie5_TC.json` instead of the English T3/tokenizer files. `config.json` and a `model.safetensors` symlink are created automatically if the directory is writable; if it is read-only, a small overlay is written under the cache.
+
+You can also pre-populate a directory (for example in a Docker image build):
+
+```python
+from chatterbox_vllm.model_store import download_model
+download_model("english", local_dir="/app/local_model")
+```
 
 If you encounter CUDA issues, try resetting the venv and using `uv pip install -e .` instead of `uv sync`.
 
 
 # Updating
 
-If you are updating from a previous version, run `uv sync` to update the dependencies. The package will automatically download the correct model weights from the Hugging Face Hub.
+If you are updating from a previous version, run `uv sync` to update the dependencies. Model weights are stored under `~/.cache/chatterbox-vllm` (or `CHATTERBOX_MODEL_DIR`) and are reused across runs.
 
 # Example
 
@@ -244,6 +263,10 @@ vLLM does not support CFG natively, so substantial hacks were needed to make it 
 </div>
 
 # Changelog
+
+## `0.2.2`
+* Replace Hugging Face cache piggybacking with a dedicated model store (`~/.cache/chatterbox-vllm` or `CHATTERBOX_MODEL_DIR`).
+* `from_local` now loads from the provided checkpoint path instead of hardcoded `./t3-model` folders, including read-only Docker mounts.
 
 ## `0.2.1`
 * Updated to multilingual v2

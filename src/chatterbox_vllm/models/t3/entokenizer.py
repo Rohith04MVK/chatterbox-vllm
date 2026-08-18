@@ -1,8 +1,7 @@
 import logging
-import os
-from typing import List, Optional, Union
+from pathlib import Path
+from typing import ClassVar, List, Optional, Union
 
-import torch
 from tokenizers import Tokenizer
 from transformers import PreTrainedTokenizer
 
@@ -21,7 +20,12 @@ class EnTokenizer(PreTrainedTokenizer):
     A VLLM-compatible tokenizer that wraps the original EnTokenizer implementation.
     """
     model_input_names = ["input_ids", "attention_mask"]
-    
+    _model_dir: ClassVar[Optional[Path]] = None
+
+    @classmethod
+    def set_model_dir(cls, model_dir: Optional[Union[str, Path]]) -> None:
+        cls._model_dir = Path(model_dir) if model_dir is not None else None
+
     def __init__(
         self,
         vocab_file: str,
@@ -44,7 +48,7 @@ class EnTokenizer(PreTrainedTokenizer):
         self.check_vocabset_sot_eot()
 
     @classmethod
-    def from_pretrained(cls, **kwargs):
+    def from_pretrained(cls, pretrained_model_name_or_path=None, *args, **kwargs):
         """
         Instantiate a tokenizer from a pretrained model or path.
         
@@ -52,8 +56,26 @@ class EnTokenizer(PreTrainedTokenizer):
             pretrained_model_name_or_path: Path to the tokenizer file or model name
             **kwargs: Additional arguments to pass to the tokenizer
         """
-        # Load relative to the current file path
-        vocab_file = os.path.join(os.path.dirname(__file__), "tokenizer.json")
+        kwargs.pop("revision", None)
+        kwargs.pop("download_dir", None)
+        kwargs.pop("trust_remote_code", None)
+
+        candidates = []
+        if cls._model_dir is not None:
+            candidates.append(cls._model_dir / "tokenizer.json")
+        if pretrained_model_name_or_path:
+            path = Path(pretrained_model_name_or_path)
+            if path.is_dir():
+                candidates.append(path / "tokenizer.json")
+            elif path.is_file():
+                candidates.append(path)
+        candidates.append(Path(__file__).resolve().parent / "tokenizer.json")
+
+        vocab_file = next((str(path) for path in candidates if path.is_file()), None)
+        if vocab_file is None:
+            raise FileNotFoundError(
+                "Could not find tokenizer.json in the model directory or package data."
+            )
         return cls(vocab_file=vocab_file, **kwargs)
 
     def check_vocabset_sot_eot(self):

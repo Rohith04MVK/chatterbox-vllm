@@ -9,10 +9,16 @@ from functools import lru_cache
 import librosa
 import torch
 import torch.nn.functional as F
-from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 
 from chatterbox_vllm.models.t3.modules.t3_config import T3Config
+from chatterbox_vllm.model_store import (
+    REPO_ID,
+    configure_tokenizers,
+    download_model,
+    looks_like_local_dir,
+    resolve_local_model,
+)
 
 from .models.s3tokenizer import S3_SR, drop_invalid_tokens
 from .models.s3gen import S3GEN_SR, S3Gen
@@ -21,8 +27,6 @@ from .models.t3 import SPEECH_TOKEN_OFFSET
 from .models.t3.modules.cond_enc import T3Cond, T3CondEnc
 from .models.t3.modules.learned_pos_emb import LearnedPositionEmbeddings
 from .text_utils import punc_norm, SUPPORTED_LANGUAGES
-
-REPO_ID = "ResembleAI/chatterbox"
 
 @dataclass
 class Conditionals:
@@ -93,28 +97,13 @@ class ChatterboxTTS:
                    # Original Chatterbox defaults this to False. I don't see a substantial performance difference when running with FP16.
                    s3gen_use_fp16: bool = False,
                    **kwargs) -> 'ChatterboxTTS':
-        ckpt_dir = Path(ckpt_dir).resolve()
+        resolved = resolve_local_model(ckpt_dir, variant)
+        configure_tokenizers(resolved.asset_dir, variant)
 
         t3_config = T3Config()
 
-        # vLLM requires the T3 transformer weights to be named 'model.safetensors'.
-        # Create a symlink inside ckpt_dir if the file doesn't already exist under that name.
-        t3_weight_filename = "t3_cfg.safetensors" if variant == "english" else "t3_mtl23ls_v2.safetensors"
-        model_safetensors_path = ckpt_dir / "model.safetensors"
-        if not model_safetensors_path.exists():
-            model_safetensors_path.unlink(missing_ok=True)  # remove stale symlink if any
-            model_safetensors_path.symlink_to(ckpt_dir / t3_weight_filename)
-
-        # vLLM requires a config.json describing the model architecture.
-        # Copy the bundled config into ckpt_dir if not already present.
-        vllm_config_path = ckpt_dir / "config.json"
-        if not vllm_config_path.exists():
-            from importlib.resources import files as pkg_files
-            config_bytes = pkg_files("chatterbox_vllm.models.t3").joinpath("config.json").read_bytes()
-            vllm_config_path.write_bytes(config_bytes)
-
         # Load *just* the necessary weights to perform inference with T3CondEnc
-        t3_weights = load_file(ckpt_dir / t3_weight_filename)
+        t3_weights = load_file(resolved.t3_weights)
 
         t3_enc = T3CondEnc(t3_config)
         t3_enc.load_state_dict({ k.replace('cond_enc.', ''):v for k,v in t3_weights.items() if k.startswith('cond_enc.') })
@@ -143,7 +132,7 @@ class ChatterboxTTS:
         print(f"Giving vLLM {vllm_memory_percent * 100:.2f}% of GPU memory ({vllm_memory_needed / 1024**2:.2f} MB)")
 
         base_vllm_kwargs = {
-            "model": str(ckpt_dir),
+            "model": str(resolved.vllm_dir),
             "task": "generate",
             "tokenizer": "EnTokenizer" if variant == "english" else "MtlTokenizer",
             "tokenizer_mode": "custom",
@@ -155,14 +144,14 @@ class ChatterboxTTS:
         t3 = LLM(**{**base_vllm_kwargs, **kwargs})
 
         ve = VoiceEncoder()
-        ve.load_state_dict(load_file(ckpt_dir / "ve.safetensors"))
+        ve.load_state_dict(load_file(resolved.asset_dir / "ve.safetensors"))
         ve = ve.to(device=target_device).eval()
 
         s3gen = S3Gen(use_fp16=s3gen_use_fp16)
-        s3gen.load_state_dict(load_file(ckpt_dir / "s3gen.safetensors"), strict=False)
+        s3gen.load_state_dict(load_file(resolved.asset_dir / "s3gen.safetensors"), strict=False)
         s3gen = s3gen.to(device=target_device).eval()
 
-        default_conds = Conditionals.load(ckpt_dir / "conds.pt")
+        default_conds = Conditionals.load(resolved.asset_dir / "conds.pt")
         default_conds.to(device=target_device)
 
         return cls(
@@ -176,21 +165,37 @@ class ChatterboxTTS:
     def from_pretrained(cls,
                         repo_id: str = REPO_ID,
                         revision: str = "1b475dffa71fb191cb6d5901215eb6f55635a9b6",
-                        *args, **kwargs) -> 'ChatterboxTTS':
-        for fpath in ["ve.safetensors", "t3_cfg.safetensors", "s3gen.safetensors", "tokenizer.json", "conds.pt"]:
-            local_path = hf_hub_download(repo_id=repo_id, filename=fpath, revision=revision)
+                        *args,
+                        download_dir: Optional[str | Path] = None,
+                        **kwargs) -> 'ChatterboxTTS':
+        if looks_like_local_dir(repo_id):
+            return cls.from_local(repo_id, variant="english", *args, **kwargs)
 
-        return cls.from_local(Path(local_path).parent, variant="english", *args, **kwargs)
+        ckpt_dir = download_model(
+            "english",
+            repo_id=repo_id,
+            revision=revision,
+            cache_dir=download_dir,
+        )
+        return cls.from_local(ckpt_dir, variant="english", *args, **kwargs)
 
     @classmethod
     def from_pretrained_multilingual(cls,
                                     repo_id: str = REPO_ID,
                                     revision: str = "05e904af2b5c7f8e482687a9d7336c5c824467d9",
-                                    *args, **kwargs) -> 'ChatterboxTTS':
-        for fpath in ["ve.safetensors", "t3_mtl23ls_v2.safetensors", "s3gen.safetensors", "grapheme_mtl_merged_expanded_v1.json", "conds.pt", "Cangjie5_TC.json"]:
-            local_path = hf_hub_download(repo_id=repo_id, filename=fpath, revision=revision)
+                                    *args,
+                                    download_dir: Optional[str | Path] = None,
+                                    **kwargs) -> 'ChatterboxTTS':
+        if looks_like_local_dir(repo_id):
+            return cls.from_local(repo_id, variant="multilingual", *args, **kwargs)
 
-        return cls.from_local(Path(local_path).parent, variant="multilingual", *args, **kwargs)
+        ckpt_dir = download_model(
+            "multilingual",
+            repo_id=repo_id,
+            revision=revision,
+            cache_dir=download_dir,
+        )
+        return cls.from_local(ckpt_dir, variant="multilingual", *args, **kwargs)
     
     def get_supported_languages(self) -> dict[str, str]:
         """Return dictionary of supported language codes and names."""

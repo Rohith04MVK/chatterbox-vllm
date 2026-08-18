@@ -1,13 +1,11 @@
 import logging
-import os
-from typing import List, Optional, Union
+from typing import ClassVar, List, Optional, Union
 from pathlib import Path
 import json
 from unicodedata import category, normalize
 
 from tokenizers import Tokenizer
 from transformers import PreTrainedTokenizer
-from huggingface_hub import hf_hub_download
 
 
 # Special tokens
@@ -19,9 +17,6 @@ SPECIAL_TOKENS = [SOT, EOT, UNK, SPACE, "[PAD]", "[SEP]", "[CLS]", "[MASK]"]
 
 logger = logging.getLogger(__name__)
 
-
-# Model repository
-REPO_ID = "ResembleAI/chatterbox"
 
 # Global instances for optional dependencies
 # _kakasi = None
@@ -86,21 +81,25 @@ def korean_normalize(text: str) -> str:
 class ChineseCangjieConverter:
     """Converts Chinese characters to Cangjie codes for tokenization."""
     
-    def __init__(self):
+    def __init__(self, cangjie_path: Optional[Union[str, Path]] = None):
         self.word2cj = {}
         self.cj2word = {}
         self.segmenter = None
-        self._load_cangjie_mapping()
+        self._load_cangjie_mapping(cangjie_path)
         self._init_segmenter()
     
-    def _load_cangjie_mapping(self):
-        """Load Cangjie mapping from HuggingFace model repository."""        
+    def _load_cangjie_mapping(self, cangjie_path: Optional[Union[str, Path]] = None):
+        """Load Cangjie mapping from the local model directory."""
+        if cangjie_path is None:
+            logger.warning("Cangjie mapping path was not provided; Chinese tokenization may degrade")
+            return
+
+        cangjie_file = Path(cangjie_path)
+        if not cangjie_file.is_file():
+            logger.warning(f"Could not load Cangjie mapping: {cangjie_file} does not exist")
+            return
+
         try:
-            cangjie_file = hf_hub_download(
-                repo_id=REPO_ID,
-                filename="Cangjie5_TC.json",
-            )
-            
             with open(cangjie_file, "r", encoding="utf-8") as fp:
                 data = json.load(fp)
             
@@ -181,7 +180,12 @@ class MTLTokenizer(PreTrainedTokenizer):
     A VLLM-compatible tokenizer that wraps the original MTLTokenizer implementation.
     """
     model_input_names = ["input_ids", "attention_mask"]
-    
+    _model_dir: ClassVar[Optional[Path]] = None
+
+    @classmethod
+    def set_model_dir(cls, model_dir: Optional[Union[str, Path]]) -> None:
+        cls._model_dir = Path(model_dir) if model_dir is not None else None
+
     def __init__(
         self,
         vocab_file_path: str,
@@ -201,11 +205,14 @@ class MTLTokenizer(PreTrainedTokenizer):
             mask_token=mask_token,
             **kwargs
         )
-        self.cangjie_converter = ChineseCangjieConverter()
+        cangjie_path = None
+        if self._model_dir is not None:
+            cangjie_path = self._model_dir / "Cangjie5_TC.json"
+        self.cangjie_converter = ChineseCangjieConverter(cangjie_path)
         self.check_vocabset_sot_eot()
 
     @classmethod
-    def from_pretrained(cls, **kwargs):
+    def from_pretrained(cls, pretrained_model_name_or_path=None, *args, **kwargs):
         """
         Instantiate a tokenizer from a pretrained model or path.
         
@@ -213,8 +220,27 @@ class MTLTokenizer(PreTrainedTokenizer):
             pretrained_model_name_or_path: Path to the tokenizer file or model name
             **kwargs: Additional arguments to pass to the tokenizer
         """
-        # Load relative to the current file path
-        vocab_file = os.path.join(os.path.dirname(__file__), "grapheme_mtl_merged_expanded_v1.json")
+        kwargs.pop("revision", None)
+        kwargs.pop("download_dir", None)
+        kwargs.pop("trust_remote_code", None)
+
+        vocab_name = "grapheme_mtl_merged_expanded_v1.json"
+        candidates = []
+        if cls._model_dir is not None:
+            candidates.append(cls._model_dir / vocab_name)
+        if pretrained_model_name_or_path:
+            path = Path(pretrained_model_name_or_path)
+            if path.is_dir():
+                candidates.append(path / vocab_name)
+            elif path.is_file():
+                candidates.append(path)
+        candidates.append(Path(__file__).resolve().parent / vocab_name)
+
+        vocab_file = next((str(path) for path in candidates if path.is_file()), None)
+        if vocab_file is None:
+            raise FileNotFoundError(
+                f"Could not find {vocab_name} in the model directory or package data."
+            )
         return cls(vocab_file_path=vocab_file, **kwargs)
 
     def check_vocabset_sot_eot(self):
