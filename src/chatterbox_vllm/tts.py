@@ -141,6 +141,17 @@ class ChatterboxTTS:
             "max_model_len": max_model_len,
         }
 
+        # Tesla T4 / Turing (SM < 8.0) cannot run bfloat16. vLLM will fall back for the
+        # Llama weights, but we still need dtype=float16 so custom T3 layers match.
+        if (
+            target_device.startswith("cuda")
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability()[0] < 8
+            and "dtype" not in kwargs
+        ):
+            print("GPU does not support bfloat16; using dtype=float16")
+            base_vllm_kwargs["dtype"] = "float16"
+
         t3 = LLM(**{**base_vllm_kwargs, **kwargs})
 
         ve = VoiceEncoder()

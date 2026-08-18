@@ -295,6 +295,28 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
 
         self.cfg_scale = float(os.environ.get("CHATTERBOX_CFG_SCALE", "0.5"))
         print("Applying CFG scale:", self.cfg_scale)
+        self._cast_custom_modules()
+
+    def _param_dtype(self) -> torch.dtype:
+        dtype = getattr(self.cfg, "dtype", None)
+        if isinstance(dtype, torch.dtype):
+            return dtype
+        if dtype in ("float16", "half"):
+            return torch.float16
+        if dtype in ("bfloat16", "bf16"):
+            return torch.bfloat16
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8:
+            return torch.float16
+        return torch.float32
+
+    def _cast_custom_modules(self) -> None:
+        dtype = self._param_dtype()
+        self.cond_enc = self.cond_enc.to(dtype=dtype)
+        self.text_emb = self.text_emb.to(dtype=dtype)
+        self.speech_emb = self.speech_emb.to(dtype=dtype)
+        self.text_pos_emb = self.text_pos_emb.to(dtype=dtype)
+        self.speech_pos_emb = self.speech_pos_emb.to(dtype=dtype)
+        self.speech_head = self.speech_head.to(dtype=dtype)
 
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -328,6 +350,10 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
 
         llama_loaded_params = self.tfmr.load_weights(hf_llama_weights.items())
         loaded_params.update('tfmr.' + i for i in llama_loaded_params)
+
+        # Checkpoints are bfloat16; Turing GPUs (T4) need the custom modules in float16
+        # to match the Llama weights vLLM already cast.
+        self._cast_custom_modules()
 
         # Precompute text positional embeddings
         text_position_ids = torch.arange(self.t3conf.max_text_tokens + 2, device=self.text_pos_emb.emb.weight.device)
@@ -639,6 +665,10 @@ class T3VllmModel(nn.Module, VllmModelForTextGeneration, SupportsMultiModal):
 
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings(input_ids, [])
+
+        llama_dtype = next(self.tfmr.parameters()).dtype
+        if inputs_embeds.dtype != llama_dtype:
+            inputs_embeds = inputs_embeds.to(dtype=llama_dtype)
 
         # Split the inputs_embeds into the three parts
         cond_embeds, uncond_embeds = inputs_embeds.split([self.dim, self.dim], dim=1)
